@@ -1,17 +1,11 @@
 # European Equity Data Tool
 
-This project provides a command-line utility that ingests European equity identifiers (tickers or ISINs), retrieves public data from Yahoo Finance, and exports a standardized fundamentals sheet covering valuation, profitability, growth, balance-sheet health, sentiment, and earnings-quality metrics.
+This project provides a command-line utility that ingests European equity ISINs, retrieves public data from Yahoo Finance, and exports a standardized fundamentals sheet covering valuation, profitability, growth, balance-sheet health, sentiment, and earnings-quality metrics.
 
 ## Quick Start
 
 ```bash
 npm install
-npm run fetch -- AAPL NESN.SW
-```
-
-The command above prints a CSV table to stdout. Use `--output` to write the results to disk.
-
-```bash
 npm run fetch -- --input data/example_input.csv --output output.csv
 ```
 
@@ -19,9 +13,9 @@ npm run fetch -- --input data/example_input.csv --output output.csv
 
 | Option | Description |
 | --- | --- |
-| `[tickers...]` | Optional positional tickers (e.g. `NESN.SW`) processed in order. |
-| `-i, --input <file>` | CSV file with headers such as `Ticker`, `ISIN`, `Company`, `Sector`. |
-| `--isin-map <file>` | Lookup table with `isin,ticker` columns. Defaults to `data/isin_map.csv`. |
+| `[isins...]` | Optional positional ISIN codes processed in order. |
+| `-i, --input <file>` | CSV file with an `ISIN` column. Other metadata columns are optional. |
+| `--isin-map <file>` | Lookup table with `isin,ticker` columns (case-insensitive headers). Defaults to `data/isin_map.csv`. |
 | `-o, --output <file>` | Write CSV results to a file instead of stdout. |
 | `--max-qps <number>` | Throttle Yahoo requests per second (default `1`). |
 
@@ -43,9 +37,11 @@ Missing Yahoo fields are surfaced as `null` while the tool continues processing 
 
 The input CSV must have a header row. Recognised columns are:
 
-- `Ticker`: Primary symbol used for Yahoo requests.
-- `ISIN`: Used as a fallback when `Ticker` is empty via the configurable ISIN map.
-- `Company`, `Sector`, `Notes`: Optional metadata preserved in the output.
+- `ISIN`: Mandatory identifier. Each ISIN is matched against the lookup map to obtain the Yahoo ticker symbol.
+- `Symbol`: Optional metadata that is simply echoed back in the output.
+- `Name`, `Market`, `Currency`: Optional metadata preserved in the output.
+
+When ISIN values are provided as positional arguments they are treated the same way as CSV rows—each ISIN is resolved through the lookup map and no symbol or name fallbacks are used.
 
 Example input files live under `data/`.
 
