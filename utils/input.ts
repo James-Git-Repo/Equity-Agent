@@ -3,16 +3,11 @@ import { resolve } from 'node:path';
 import { parse } from 'csv-parse/sync';
 
 export interface RawInputRow {
-  Ticker?: string;
+  Name?: string;
   ISIN?: string;
-  Company?: string;
-  Sector?: string;
-  Notes?: string;
-}
-
-export interface IsinRecord {
-  isin: string;
-  ticker: string;
+  Symbol?: string;
+  Market?: string;
+  Currency?: string;
 }
 
 export function normalizeTicker(value: string): string {
@@ -36,11 +31,13 @@ export function loadIsinMap(filePath: string): Record<string, string> {
     columns: true,
     skip_empty_lines: true,
     trim: true
-  }) as IsinRecord[];
+  }) as Record<string, string>[];
   const map: Record<string, string> = {};
   rows.forEach((row) => {
-    if (row.isin && row.ticker) {
-      map[row.isin.toUpperCase()] = normalizeTicker(row.ticker);
+    const isinValue = row.ISIN ?? row.isin ?? row.Isin;
+    const tickerValue = row.ticker ?? row.Ticker ?? row.symbol ?? row.Symbol;
+    if (isinValue && tickerValue) {
+      map[isinValue.toUpperCase()] = normalizeTicker(tickerValue);
     }
   });
   return map;

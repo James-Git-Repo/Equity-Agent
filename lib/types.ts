@@ -7,6 +7,38 @@ export interface ProcessingLogItem {
   message: string;
 }
 
+export interface InputRow {
+  input: string;
+  ticker?: string;
+  isin?: string;
+  symbol?: string;
+  name?: string;
+  market?: string;
+  currency?: string;
+  inputRank: number;
+}
+
+export interface MetricRow {
+  ticker: string;
+  status: 'ok' | 'error';
+  statusMessage?: string;
+  compositeScore?: number;
+  subscores?: Record<string, number | null>;
+  momentumTag?: string | null;
+  expReturn6M?: {
+    base: number | null;
+    bull: number | null;
+    bear: number | null;
+    confidence?: number | null;
+  };
+  metrics?: Record<string, number | string | null>;
+}
+
+export interface RunResponse {
+  rows: MetricRow[];
+  logs: ProcessingLogItem[];
+}
+
 export interface YahooQuoteSummaryResponse {
   price?: {
     regularMarketPrice?: { raw?: number };

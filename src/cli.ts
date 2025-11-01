@@ -3,25 +3,38 @@ import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Command } from 'commander';
 import Papa from 'papaparse';
+import yahooFinance from 'yahoo-finance2';
 import { buildFinancialSnapshot, computeDCF, computeSeriesCagr, deriveMetrics } from '../lib/calculations';
 import { fetchYahooBundle } from '../lib/yahoo';
 import type { YahooQuoteSummaryResponse } from '../lib/types';
 import { loadIsinMap, normalizeTicker, parseInputFile, type RawInputRow } from '../utils/input';
 
+type LookupKind = 'isin' | 'symbol' | 'name';
+
+interface LookupCandidate {
+  type: LookupKind;
+  value: string;
+}
+
 interface InputEntry {
   input: string;
-  ticker: string;
-  isin?: string;
-  company?: string;
-  sector?: string;
+  lookups: LookupCandidate[];
+  meta: {
+    isin?: string;
+    symbol?: string;
+    name?: string;
+    market?: string;
+    currency?: string;
+  };
 }
 
 interface OutputRow {
   Input: string;
   Ticker: string;
   ISIN?: string;
-  Company?: string;
-  Sector?: string;
+  Name?: string;
+  Market?: string;
+  Currency?: string;
   Price: number | null;
   'Shares_Out (M)': number | null;
   Total_Debt: number | null;
@@ -68,26 +81,159 @@ function estimateWacc(beta: number | null): number {
   return Math.min(Math.max(raw, 0.06), 0.14);
 }
 
-function parseRows(filePath: string | undefined, isinMap: Record<string, string>): InputEntry[] {
+function parseRows(filePath: string | undefined): InputEntry[] {
   if (!filePath) return [];
   const rows = parseInputFile(filePath);
-  return rows.map((row, index) => resolveEntry(row, index, isinMap)).filter((entry): entry is InputEntry => entry !== null);
+  return rows
+    .map((row, index) => resolveEntry(row, index))
+    .filter((entry): entry is InputEntry => entry !== null);
 }
 
-function resolveEntry(row: RawInputRow, index: number, isinMap: Record<string, string>): InputEntry | null {
-  const source = row.Ticker || row.ISIN || `row_${index + 1}`;
-  const rawTicker = row.Ticker ? normalizeTicker(row.Ticker) : undefined;
-  const ticker = rawTicker || (row.ISIN ? isinMap[row.ISIN.toUpperCase()] : undefined);
-  if (!ticker) {
+function resolveEntry(row: RawInputRow, index: number): InputEntry | null {
+  const candidates: LookupCandidate[] = [];
+  const meta: InputEntry['meta'] = {};
+
+  const isin = row.ISIN?.trim();
+  if (isin) {
+    const normalizedIsin = isin.toUpperCase();
+    candidates.push({ type: 'isin', value: normalizedIsin });
+    meta.isin = normalizedIsin;
+  }
+
+  if (row.Symbol) {
+    const normalizedSymbol = normalizeTicker(row.Symbol);
+    candidates.push({ type: 'symbol', value: normalizedSymbol });
+    meta.symbol = normalizedSymbol;
+  }
+
+  if (row.Name) {
+    const trimmedName = row.Name.trim();
+    if (trimmedName) {
+      candidates.push({ type: 'name', value: trimmedName });
+      meta.name = trimmedName;
+    }
+  }
+
+  if (row.Market) {
+    const trimmedMarket = row.Market.trim();
+    if (trimmedMarket) {
+      meta.market = trimmedMarket;
+    }
+  }
+
+  if (row.Currency) {
+    const trimmedCurrency = row.Currency.trim();
+    if (trimmedCurrency) {
+      meta.currency = trimmedCurrency;
+    }
+  }
+
+  if (!candidates.length) {
     return null;
   }
+
+  const input = meta.isin ?? meta.symbol ?? meta.name ?? `row_${index + 1}`;
+
   return {
-    input: source,
-    ticker,
-    isin: row.ISIN?.toUpperCase(),
-    company: row.Company,
-    sector: row.Sector
+    input,
+    lookups: candidates,
+    meta
   };
+}
+
+function quoteHasSymbol(quote: unknown): quote is { symbol: string } {
+  return (
+    typeof quote === 'object' &&
+    quote !== null &&
+    'symbol' in quote &&
+    typeof (quote as { symbol?: unknown }).symbol === 'string'
+  );
+}
+
+async function lookupTickerByName(name: string): Promise<string | undefined> {
+  if (!name) return undefined;
+  try {
+    const result = await yahooFinance.search(name, { quotesCount: 5, newsCount: 0 });
+    const quotes = Array.isArray(result.quotes) ? result.quotes : [];
+    for (const quote of quotes) {
+      if (quoteHasSymbol(quote) && !quote.symbol.includes('=')) {
+        return normalizeTicker(quote.symbol);
+      }
+    }
+    return undefined;
+  } catch (error) {
+    return undefined;
+  }
+}
+
+async function fetchWithFallback(entry: InputEntry, maxQps: number, isinMap: Record<string, string>): Promise<OutputRow> {
+  const attemptNotes: string[] = [];
+  let lastTicker: string | undefined;
+
+  for (const lookup of entry.lookups) {
+    let candidateTicker: string | undefined;
+    if (lookup.type === 'isin') {
+      candidateTicker = isinMap[lookup.value];
+      if (!candidateTicker) {
+        attemptNotes.push(`ISIN ${lookup.value} not present in lookup table`);
+        continue;
+      }
+    } else if (lookup.type === 'symbol') {
+      candidateTicker = lookup.value;
+    } else if (lookup.type === 'name') {
+      candidateTicker = await lookupTickerByName(lookup.value);
+      if (!candidateTicker) {
+        attemptNotes.push(`Name search returned no ticker for "${lookup.value}"`);
+        continue;
+      }
+    }
+
+    if (!candidateTicker) {
+      continue;
+    }
+
+    lastTicker = candidateTicker;
+    const yahoo = await fetchYahooBundle(candidateTicker, { maxQps });
+    if (yahoo.error || !yahoo.data) {
+      attemptNotes.push(
+        `Yahoo fetch failed for ${candidateTicker} (from ${lookup.type.toUpperCase()} ${lookup.value}): ${
+          yahoo.error ?? 'Missing Yahoo data'
+        }`
+      );
+      continue;
+    }
+
+    return buildOutput(
+      candidateTicker,
+      entry.input,
+      yahoo.data as YahooQuoteSummaryResponse,
+      'ok',
+      undefined,
+      {
+        isin: entry.meta.isin,
+        name: entry.meta.name,
+        market: entry.meta.market,
+        currency: entry.meta.currency
+      }
+    );
+  }
+
+  const fallbackTicker = lastTicker ?? entry.meta.symbol ?? entry.meta.isin ?? entry.input;
+  const message = attemptNotes.length ? attemptNotes.join(' | ') : 'Unresolved ticker or missing data';
+
+  return buildOutput(
+    fallbackTicker,
+    entry.input,
+    undefined,
+    'error',
+    message,
+    {
+      isin: entry.meta.isin,
+      name: entry.meta.name,
+      market: entry.meta.market,
+      currency: entry.meta.currency
+    }
+  );
 }
 
 function buildOutput(
@@ -96,15 +242,16 @@ function buildOutput(
   data: YahooQuoteSummaryResponse | undefined,
   status: 'ok' | 'error',
   message?: string,
-  meta?: { isin?: string; company?: string; sector?: string }
+  meta?: { isin?: string; name?: string; market?: string; currency?: string }
 ): OutputRow {
   if (!data || status === 'error') {
     return {
       Input: input,
       Ticker: ticker,
       ISIN: meta?.isin,
-      Company: meta?.company,
-      Sector: meta?.sector,
+      Name: meta?.name,
+      Market: meta?.market,
+      Currency: meta?.currency,
       Price: null,
       'Shares_Out (M)': null,
       Total_Debt: null,
@@ -176,8 +323,9 @@ function buildOutput(
     Input: input,
     Ticker: ticker,
     ISIN: meta?.isin,
-    Company: meta?.company,
-    Sector: meta?.sector,
+    Name: meta?.name,
+    Market: meta?.market,
+    Currency: meta?.currency,
     Price: snapshot.price ?? null,
     'Shares_Out (M)': snapshot.sharesOutstanding ? snapshot.sharesOutstanding / 1_000_000 : null,
     Total_Debt: snapshot.totalDebt ?? null,
@@ -223,7 +371,7 @@ async function main() {
     .name('equity-agent')
     .description('Fetch fundamental datasets for equities using Yahoo Finance data')
     .argument('[tickers...]', 'Ticker symbols to fetch')
-    .option('-i, --input <file>', 'CSV input containing Ticker or ISIN columns')
+    .option('-i, --input <file>', 'CSV input containing Symbol or ISIN columns')
     .option('--isin-map <file>', 'CSV lookup table with columns isin,ticker', 'data/isin_map.csv')
     .option('-o, --output <file>', 'Write results to CSV file instead of stdout')
     .option('--max-qps <number>', 'Maximum Yahoo Finance requests per second', '1')
@@ -237,13 +385,17 @@ async function main() {
   const entries: InputEntry[] = [];
 
   if (opts.input) {
-    const parsed = parseRows(opts.input, isinMap);
+    const parsed = parseRows(opts.input);
     entries.push(...parsed);
   }
 
   argTickers.forEach((value) => {
     if (value) {
-      entries.push({ input: value, ticker: value });
+      entries.push({
+        input: value,
+        lookups: [{ type: 'symbol', value }],
+        meta: { symbol: value }
+      });
     }
   });
 
@@ -255,25 +407,8 @@ async function main() {
   const results: OutputRow[] = [];
 
   for (const entry of entries) {
-    const yahoo = await fetchYahooBundle(entry.ticker, { maxQps });
-    if (yahoo.error || !yahoo.data) {
-      results.push(
-        buildOutput(entry.ticker, entry.input, yahoo.data, 'error', yahoo.error ?? 'Missing Yahoo data', {
-          isin: entry.isin,
-          company: entry.company,
-          sector: entry.sector
-        })
-      );
-      continue;
-    }
-
-    results.push(
-      buildOutput(entry.ticker, entry.input, yahoo.data as YahooQuoteSummaryResponse, 'ok', undefined, {
-        isin: entry.isin,
-        company: entry.company,
-        sector: entry.sector
-      })
-    );
+    const row = await fetchWithFallback(entry, maxQps, isinMap);
+    results.push(row);
   }
 
   const csv = Papa.unparse(results, { quotes: false, newline: '\n' });
