@@ -10,18 +10,23 @@ import { loadIsinMap, normalizeTicker, parseInputFile, type RawInputRow } from '
 
 interface InputEntry {
   input: string;
-  ticker: string;
-  isin?: string;
-  company?: string;
-  sector?: string;
+  isin: string;
+  meta: {
+    isin?: string;
+    symbol?: string;
+    name?: string;
+    market?: string;
+    currency?: string;
+  };
 }
 
 interface OutputRow {
   Input: string;
   Ticker: string;
   ISIN?: string;
-  Company?: string;
-  Sector?: string;
+  Name?: string;
+  Market?: string;
+  Currency?: string;
   Price: number | null;
   'Shares_Out (M)': number | null;
   Total_Debt: number | null;
@@ -68,26 +73,118 @@ function estimateWacc(beta: number | null): number {
   return Math.min(Math.max(raw, 0.06), 0.14);
 }
 
-function parseRows(filePath: string | undefined, isinMap: Record<string, string>): InputEntry[] {
+function parseRows(filePath: string | undefined): InputEntry[] {
   if (!filePath) return [];
   const rows = parseInputFile(filePath);
-  return rows.map((row, index) => resolveEntry(row, index, isinMap)).filter((entry): entry is InputEntry => entry !== null);
+  const missingIsinRows: number[] = [];
+  const entries: InputEntry[] = [];
+
+  rows.forEach((row, index) => {
+    const entry = resolveEntry(row);
+    if (!entry) {
+      missingIsinRows.push(index + 1);
+    } else {
+      entries.push(entry);
+    }
+  });
+
+  if (missingIsinRows.length) {
+    throw new Error(
+      `Input file ${filePath} is missing ISIN values on rows ${missingIsinRows.join(', ')}. ` +
+        'Each row must provide an ISIN so the lookup map can resolve the Yahoo ticker.'
+    );
+  }
+
+  return entries;
 }
 
-function resolveEntry(row: RawInputRow, index: number, isinMap: Record<string, string>): InputEntry | null {
-  const source = row.Ticker || row.ISIN || `row_${index + 1}`;
-  const rawTicker = row.Ticker ? normalizeTicker(row.Ticker) : undefined;
-  const ticker = rawTicker || (row.ISIN ? isinMap[row.ISIN.toUpperCase()] : undefined);
-  if (!ticker) {
-    return null;
+function resolveEntry(row: RawInputRow): InputEntry | null {
+  const meta: InputEntry['meta'] = {};
+
+  const isin = row.ISIN?.trim();
+  if (isin) {
+    const normalizedIsin = isin.toUpperCase();
+    meta.isin = normalizedIsin;
+    if (row.Symbol) {
+      meta.symbol = normalizeTicker(row.Symbol);
+    }
+    if (row.Name) {
+      const trimmedName = row.Name.trim();
+      if (trimmedName) {
+        meta.name = trimmedName;
+      }
+    }
+    if (row.Market) {
+      const trimmedMarket = row.Market.trim();
+      if (trimmedMarket) {
+        meta.market = trimmedMarket;
+      }
+    }
+    if (row.Currency) {
+      const trimmedCurrency = row.Currency.trim();
+      if (trimmedCurrency) {
+        meta.currency = trimmedCurrency;
+      }
+    }
+
+    return {
+      input: normalizedIsin,
+      isin: normalizedIsin,
+      meta
+    };
   }
-  return {
-    input: source,
-    ticker,
-    isin: row.ISIN?.toUpperCase(),
-    company: row.Company,
-    sector: row.Sector
-  };
+
+  return null;
+}
+
+async function fetchEntry(entry: InputEntry, maxQps: number, isinMap: Record<string, string>): Promise<OutputRow> {
+  const mappedTicker = isinMap[entry.isin];
+  if (!mappedTicker) {
+    return buildOutput(
+      entry.isin,
+      entry.input,
+      undefined,
+      'error',
+      `ISIN ${entry.isin} not present in lookup table`,
+      {
+        isin: entry.meta.isin,
+        name: entry.meta.name,
+        market: entry.meta.market,
+        currency: entry.meta.currency
+      }
+    );
+  }
+
+  const yahoo = await fetchYahooBundle(mappedTicker, { maxQps });
+  if (yahoo.error || !yahoo.data) {
+    return buildOutput(
+      mappedTicker,
+      entry.input,
+      undefined,
+      'error',
+      `Yahoo fetch failed for ${mappedTicker}: ${yahoo.error ?? 'Missing Yahoo data'}`,
+      {
+        isin: entry.meta.isin,
+        name: entry.meta.name,
+        market: entry.meta.market,
+        currency: entry.meta.currency
+      }
+    );
+  }
+
+  return buildOutput(
+    mappedTicker,
+    entry.input,
+    yahoo.data as YahooQuoteSummaryResponse,
+    'ok',
+    undefined,
+    {
+      isin: entry.meta.isin,
+      name: entry.meta.name,
+      market: entry.meta.market,
+      currency: entry.meta.currency
+    }
+  );
 }
 
 function buildOutput(
@@ -96,15 +193,16 @@ function buildOutput(
   data: YahooQuoteSummaryResponse | undefined,
   status: 'ok' | 'error',
   message?: string,
-  meta?: { isin?: string; company?: string; sector?: string }
+  meta?: { isin?: string; name?: string; market?: string; currency?: string }
 ): OutputRow {
   if (!data || status === 'error') {
     return {
       Input: input,
       Ticker: ticker,
       ISIN: meta?.isin,
-      Company: meta?.company,
-      Sector: meta?.sector,
+      Name: meta?.name,
+      Market: meta?.market,
+      Currency: meta?.currency,
       Price: null,
       'Shares_Out (M)': null,
       Total_Debt: null,
@@ -176,8 +274,9 @@ function buildOutput(
     Input: input,
     Ticker: ticker,
     ISIN: meta?.isin,
-    Company: meta?.company,
-    Sector: meta?.sector,
+    Name: meta?.name,
+    Market: meta?.market,
+    Currency: meta?.currency,
     Price: snapshot.price ?? null,
     'Shares_Out (M)': snapshot.sharesOutstanding ? snapshot.sharesOutstanding / 1_000_000 : null,
     Total_Debt: snapshot.totalDebt ?? null,
@@ -222,58 +321,49 @@ async function main() {
   program
     .name('equity-agent')
     .description('Fetch fundamental datasets for equities using Yahoo Finance data')
-    .argument('[tickers...]', 'Ticker symbols to fetch')
-    .option('-i, --input <file>', 'CSV input containing Ticker or ISIN columns')
+    .argument('[isins...]', 'ISIN codes to fetch')
+    .option('-i, --input <file>', 'CSV input containing ISIN values for each row')
     .option('--isin-map <file>', 'CSV lookup table with columns isin,ticker', 'data/isin_map.csv')
     .option('-o, --output <file>', 'Write results to CSV file instead of stdout')
     .option('--max-qps <number>', 'Maximum Yahoo Finance requests per second', '1')
     .parse(process.argv);
 
   const opts = program.opts<{ input?: string; isinMap?: string; output?: string; maxQps?: string }>();
-  const argTickers = (program.args as string[]).map((value) => normalizeTicker(value));
+  const argIsins = (program.args as string[]).map((value) => value.trim().toUpperCase()).filter((value) => value.length > 0);
 
   const isinMapPath = opts.isinMap ? resolve(opts.isinMap) : resolve('data/isin_map.csv');
   const isinMap = loadIsinMap(isinMapPath);
   const entries: InputEntry[] = [];
 
   if (opts.input) {
-    const parsed = parseRows(opts.input, isinMap);
+    const parsed = parseRows(opts.input);
     entries.push(...parsed);
   }
 
-  argTickers.forEach((value) => {
-    if (value) {
-      entries.push({ input: value, ticker: value });
-    }
+  argIsins.forEach((value) => {
+    entries.push({
+      input: value,
+      isin: value,
+      meta: { isin: value }
+    });
   });
 
   if (!entries.length) {
-    throw new Error('No tickers provided. Use positional arguments or --input.');
+    if (opts.input) {
+      throw new Error(
+        `No ISIN values found in ${opts.input}. Ensure each row provides an ISIN or supply ISINs as arguments.`
+      );
+    }
+
+    throw new Error('No ISIN values provided. Use positional arguments or --input.');
   }
 
   const maxQps = Number.parseFloat(opts.maxQps ?? '1');
   const results: OutputRow[] = [];
 
   for (const entry of entries) {
-    const yahoo = await fetchYahooBundle(entry.ticker, { maxQps });
-    if (yahoo.error || !yahoo.data) {
-      results.push(
-        buildOutput(entry.ticker, entry.input, yahoo.data, 'error', yahoo.error ?? 'Missing Yahoo data', {
-          isin: entry.isin,
-          company: entry.company,
-          sector: entry.sector
-        })
-      );
-      continue;
-    }
-
-    results.push(
-      buildOutput(entry.ticker, entry.input, yahoo.data as YahooQuoteSummaryResponse, 'ok', undefined, {
-        isin: entry.isin,
-        company: entry.company,
-        sector: entry.sector
-      })
-    );
+    const row = await fetchEntry(entry, maxQps, isinMap);
+    results.push(row);
   }
 
   const csv = Papa.unparse(results, { quotes: false, newline: '\n' });
