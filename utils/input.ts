@@ -1,56 +1,47 @@
-import Papa from 'papaparse';
-import type { InputRow } from '../lib/types';
-import { read, utils } from 'xlsx';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { parse } from 'csv-parse/sync';
+
+export interface RawInputRow {
+  Ticker?: string;
+  ISIN?: string;
+  Company?: string;
+  Sector?: string;
+  Notes?: string;
+}
+
+export interface IsinRecord {
+  isin: string;
+  ticker: string;
+}
 
 export function normalizeTicker(value: string): string {
   return value.trim().toUpperCase().replace(/\s+/g, '');
 }
 
-export async function parseInput(formData: FormData): Promise<InputRow[]> {
-  const entries: InputRow[] = [];
-  const manual = (formData.get('tickers') as string | null) ?? '';
-  const manualLines = manual
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+export function parseInputFile(filePath: string): RawInputRow[] {
+  const absolute = resolve(filePath);
+  const text = readFileSync(absolute, 'utf8');
+  return parse(text, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true
+  }) as RawInputRow[];
+}
 
-  manualLines.forEach((line, index) => {
-    entries.push({ input: line, ticker: normalizeTicker(line), inputRank: entries.length + 1 });
-  });
-
-  const file = formData.get('file') as File | null;
-  if (file && file.size > 0) {
-    const buffer = await file.arrayBuffer();
-    if (file.name.endsWith('.csv')) {
-      const text = new TextDecoder('utf-8').decode(buffer);
-      const parsed = Papa.parse<Record<string, string>>(text, { header: true, skipEmptyLines: true });
-      parsed.data.forEach((row) => {
-        const ticker = row.Ticker ? normalizeTicker(row.Ticker) : row.ISIN ? normalizeTicker(row.ISIN) : undefined;
-        entries.push({
-          input: row.Ticker ?? row.ISIN ?? '',
-          ticker,
-          isin: row.ISIN?.trim(),
-          notes: row.Notes?.trim(),
-          inputRank: entries.length + 1
-        });
-      });
-    } else {
-      const workbook = read(buffer, { type: 'array' });
-      const sheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[sheetName];
-      const rows = utils.sheet_to_json<Record<string, string>>(sheet, { defval: '' });
-      rows.forEach((row) => {
-        const ticker = row.Ticker ? normalizeTicker(row.Ticker) : row.ISIN ? normalizeTicker(row.ISIN) : undefined;
-        entries.push({
-          input: row.Ticker ?? row.ISIN ?? '',
-          ticker,
-          isin: row.ISIN?.trim(),
-          notes: row.Notes?.trim(),
-          inputRank: entries.length + 1
-        });
-      });
+export function loadIsinMap(filePath: string): Record<string, string> {
+  const absolute = resolve(filePath);
+  const text = readFileSync(absolute, 'utf8');
+  const rows = parse(text, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true
+  }) as IsinRecord[];
+  const map: Record<string, string> = {};
+  rows.forEach((row) => {
+    if (row.isin && row.ticker) {
+      map[row.isin.toUpperCase()] = normalizeTicker(row.ticker);
     }
-  }
-
-  return entries;
+  });
+  return map;
 }

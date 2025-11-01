@@ -13,13 +13,6 @@ const modules = [
   'earningsTrend'
 ] as const;
 
-yahooFinance.setGlobalConfig({
-  queue: {
-    concurrency: 1,
-    timeout: 60_000
-  }
-});
-
 export interface YahooFetchResult {
   data?: YahooQuoteSummaryResponse;
   history?: YahooPriceHistoryPoint[];
@@ -66,7 +59,7 @@ export async function fetchYahooBundle(ticker: string, options?: YahooClientOpti
         await delay(minInterval);
       }
 
-      const data = (await yahooFinance.quoteSummary(ticker, { modules: modules as unknown as string[] })) as unknown as YahooQuoteSummaryResponse;
+      const data = (await yahooFinance.quoteSummary(ticker, { modules: modules as unknown as any })) as unknown as YahooQuoteSummaryResponse;
       const historyResponse = await yahooFinance.historical(ticker, {
         period1: new Date(Date.now() - 1000 * 60 * 60 * 24 * 365),
         period2: new Date(),
@@ -74,8 +67,8 @@ export async function fetchYahooBundle(ticker: string, options?: YahooClientOpti
       });
 
       const history: YahooPriceHistoryPoint[] = historyResponse
-        .filter((point) => point.close !== undefined)
-        .map((point) => ({ date: new Date(point.date), close: point.close! }));
+        .filter((point): point is typeof point & { close: number } => typeof point.close === 'number')
+        .map((point) => ({ date: new Date(point.date as string | number | Date), close: point.close }));
 
       logs.push({
         level: 'info',

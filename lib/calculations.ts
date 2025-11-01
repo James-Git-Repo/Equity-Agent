@@ -93,8 +93,8 @@ export function buildFinancialSnapshot(data: YahooQuoteSummaryResponse): Financi
     cogs: incomeStatements?.[0]?.costOfRevenue?.raw ?? null,
     beta: data.price?.beta?.raw ?? null,
     shortInterestPct: data.defaultKeyStatistics?.shortPercentOfFloat?.raw ?? null,
-    insiderNetBuys: data.defaultKeyStatistics?.insiderHoldersPercentHeld?.raw ?? null,
-    institutionalPct: data.defaultKeyStatistics?.institutionalHoldersPercentHeld?.raw ?? null,
+    insiderNetBuys: data.defaultKeyStatistics?.heldPercentInsiders?.raw ?? null,
+    institutionalPct: data.defaultKeyStatistics?.heldPercentInstitutions?.raw ?? null,
     fundFlows3M: null,
     retainedEarnings: balanceSheets?.[0]?.retainedEarnings?.raw ?? null,
     totalLiabilities: balanceSheets?.[0]?.totalLiab?.raw ?? null
@@ -108,6 +108,10 @@ function growth(series: number[]): number | null {
   if (first === undefined || last === undefined || first <= 0 || last <= 0) return null;
   const years = Math.min(series.length - 1, 3);
   return (last / first) ** (1 / years) - 1;
+}
+
+export function computeSeriesCagr(series: number[]): number | null {
+  return growth(series);
 }
 
 export function computeDCF(snapshot: FinancialSnapshot, wacc: number, terminalGrowth = 0.02): number | null {
