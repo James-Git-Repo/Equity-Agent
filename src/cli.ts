@@ -1,24 +1,20 @@
 #!/usr/bin/env ts-node
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Command } from 'commander';
 import Papa from 'papaparse';
 import { buildFinancialSnapshot, computeDCF, computeSeriesCagr, deriveMetrics } from '../lib/calculations';
 import { fetchYahooBundle } from '../lib/yahoo';
 import type { YahooQuoteSummaryResponse } from '../lib/types';
-import { loadIsinMap, normalizeTicker, parseInputFile, type RawInputRow } from '../utils/input';
+import { normalizeTicker } from '../utils/input';
 
 interface InputEntry {
   input: string;
-  isin: string;
-  meta: {
-    isin?: string;
-    symbol?: string;
-    name?: string;
-    market?: string;
-    currency?: string;
-  };
+  ticker: string;
 }
+
+const DEFAULT_ALPHASPREAD_KEY = 'IJ2RNTVBPOGCMXU6';
+const DEFAULT_FMP_KEY = 'F1yosD2d9MyjBwAYw95MkRAKpdsGxIja';
 
 interface OutputRow {
   Input: string;
@@ -65,6 +61,138 @@ interface OutputRow {
   Message?: string;
 }
 
+async function fetchJson<T>(url: string): Promise<T | null> {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // eslint-disable-next-line no-console
+    console.warn(`Data check fetch failed for ${url}: ${message}`);
+    return null;
+  }
+}
+
+async function fetchFmpBalance(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${ticker}?limit=1&apikey=${apiKey}`
+  );
+}
+
+async function fetchFmpCashflow(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v3/cash-flow-statement/${ticker}?limit=1&apikey=${apiKey}`
+  );
+}
+
+async function fetchFmpIncome(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v3/income-statement/${ticker}?limit=1&apikey=${apiKey}`
+  );
+}
+
+async function fetchFmpShortInterest(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v4/short-interest?symbol=${ticker}&apikey=${apiKey}`
+  );
+}
+
+function coerceNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return value;
+  const parsed = Number.parseFloat(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mergeMessage(row: OutputRow, note: string) {
+  if (!note) return;
+  if (row.Message) {
+    row.Message = `${row.Message}; ${note}`;
+  } else {
+    row.Message = note;
+  }
+}
+
+async function backfillFromFmp(row: OutputRow, apiKey: string): Promise<void> {
+  const [balance, cashflow, income, shortInterest] = await Promise.all([
+    row.Total_Equity === null || row.Receivables === null || row.Current_Assets === null || row.Current_Liabilities === null
+      ? fetchFmpBalance(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null),
+    row.Dividends_Paid === null
+      ? fetchFmpCashflow(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null),
+    row.Tax_Rate === null
+      ? fetchFmpIncome(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null),
+    row['Short_Interest_%'] === null
+      ? fetchFmpShortInterest(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null)
+  ]);
+
+  const balanceRow = balance?.[0];
+  if (balanceRow) {
+    if (row.Total_Equity === null) row.Total_Equity = coerceNumber(balanceRow.totalStockholdersEquity);
+    if (row.Receivables === null) row.Receivables = coerceNumber(balanceRow.netReceivables);
+    if (row.Current_Assets === null) row.Current_Assets = coerceNumber(balanceRow.totalCurrentAssets ?? balanceRow.currentAssets);
+    if (row.Current_Liabilities === null) {
+      row.Current_Liabilities = coerceNumber(
+        balanceRow.totalCurrentLiabilities ?? balanceRow.currentLiabilities ?? balanceRow.totalCurrentLiabilitiesNet
+      );
+    }
+  }
+
+  const cashflowRow = cashflow?.[0];
+  if (cashflowRow && row.Dividends_Paid === null) {
+    row.Dividends_Paid = coerceNumber(cashflowRow.dividendsPaid ?? cashflowRow.dividendPayout);
+  }
+
+  const incomeRow = income?.[0];
+  if (incomeRow && row.Tax_Rate === null) {
+    const tax = coerceNumber(incomeRow.incomeTaxExpense);
+    const pretax = coerceNumber(incomeRow.incomeBeforeTax);
+    if (tax !== null && pretax !== null && pretax !== 0) {
+      row.Tax_Rate = Math.max(0, Math.min(1, tax / pretax));
+    }
+  }
+
+  const shortInterestRow = shortInterest?.[0];
+  if (shortInterestRow && row['Short_Interest_%'] === null) {
+    const percent = coerceNumber(shortInterestRow.shortInterestRatio ?? shortInterestRow.shortPercent ?? shortInterestRow.shortFloat);
+    if (percent !== null) {
+      row['Short_Interest_%'] = percent;
+    }
+  }
+}
+
+async function checkAlphaspread(row: OutputRow, apiKey: string): Promise<void> {
+  // Alphaspread API details are not public; we log the intention to fetch without failing the run.
+  if (row.Tax_Rate !== null && row.Total_Equity !== null && row.Dividends_Paid !== null && row.Receivables !== null) return;
+  mergeMessage(row, `Alphaspread key ${apiKey} available for supplementary checks (no public endpoint configured)`);
+}
+
+async function ensureDataCompleteness(row: OutputRow): Promise<OutputRow> {
+  if (row.Status !== 'ok') return row;
+  const alphaspreadKey = process.env.ALPHASPREAD_API_KEY || DEFAULT_ALPHASPREAD_KEY;
+  const fmpKey = process.env.FMP_API_KEY || DEFAULT_FMP_KEY;
+
+  const before = { ...row };
+  await Promise.all([checkAlphaspread(row, alphaspreadKey), backfillFromFmp(row, fmpKey)]);
+
+  const touched: string[] = [];
+  (['Total_Equity', 'Dividends_Paid', 'Receivables', 'Tax_Rate', 'Short_Interest_%'] as const).forEach((field) => {
+    if (before[field] !== row[field] && row[field] !== null) {
+      touched.push(`${field} from supplemental sources`);
+    }
+  });
+
+  if (touched.length) {
+    mergeMessage(row, touched.join('; '));
+  }
+
+  return row;
+}
+
 function estimateWacc(beta: number | null): number {
   const baseRate = 0.02;
   const marketPremium = 0.05;
@@ -73,118 +201,47 @@ function estimateWacc(beta: number | null): number {
   return Math.min(Math.max(raw, 0.06), 0.14);
 }
 
-function parseRows(filePath: string | undefined): InputEntry[] {
+function parseTickerFile(filePath: string | undefined): InputEntry[] {
   if (!filePath) return [];
-  const rows = parseInputFile(filePath);
-  const missingIsinRows: number[] = [];
+  const absolute = resolve(filePath);
+  const content = readFileSync(absolute, 'utf8');
   const entries: InputEntry[] = [];
 
-  rows.forEach((row, index) => {
-    const entry = resolveEntry(row);
-    if (!entry) {
-      missingIsinRows.push(index + 1);
-    } else {
-      entries.push(entry);
-    }
-  });
-
-  if (missingIsinRows.length) {
-    throw new Error(
-      `Input file ${filePath} is missing ISIN values on rows ${missingIsinRows.join(', ')}. ` +
-        'Each row must provide an ISIN so the lookup map can resolve the Yahoo ticker.'
-    );
-  }
+  content
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .forEach((line) => {
+      entries.push({
+        input: line,
+        ticker: normalizeTicker(line)
+      });
+    });
 
   return entries;
 }
 
-function resolveEntry(row: RawInputRow): InputEntry | null {
-  const meta: InputEntry['meta'] = {};
-
-  const isin = row.ISIN?.trim();
-  if (isin) {
-    const normalizedIsin = isin.toUpperCase();
-    meta.isin = normalizedIsin;
-    if (row.Symbol) {
-      meta.symbol = normalizeTicker(row.Symbol);
-    }
-    if (row.Name) {
-      const trimmedName = row.Name.trim();
-      if (trimmedName) {
-        meta.name = trimmedName;
-      }
-    }
-    if (row.Market) {
-      const trimmedMarket = row.Market.trim();
-      if (trimmedMarket) {
-        meta.market = trimmedMarket;
-      }
-    }
-    if (row.Currency) {
-      const trimmedCurrency = row.Currency.trim();
-      if (trimmedCurrency) {
-        meta.currency = trimmedCurrency;
-      }
-    }
-
-    return {
-      input: normalizedIsin,
-      isin: normalizedIsin,
-      meta
-    };
-  }
-
-  return null;
-}
-
-async function fetchEntry(entry: InputEntry, maxQps: number, isinMap: Record<string, string>): Promise<OutputRow> {
-  const mappedTicker = isinMap[entry.isin];
-  if (!mappedTicker) {
-    return buildOutput(
-      entry.isin,
-      entry.input,
-      undefined,
-      'error',
-      `ISIN ${entry.isin} not present in lookup table`,
-      {
-        isin: entry.meta.isin,
-        name: entry.meta.name,
-        market: entry.meta.market,
-        currency: entry.meta.currency
-      }
-    );
-  }
-
-  const yahoo = await fetchYahooBundle(mappedTicker, { maxQps });
+async function fetchEntry(entry: InputEntry, maxQps: number): Promise<OutputRow> {
+  const yahoo = await fetchYahooBundle(entry.ticker, { maxQps });
   if (yahoo.error || !yahoo.data) {
     return buildOutput(
-      mappedTicker,
+      entry.ticker,
       entry.input,
       undefined,
       'error',
-      `Yahoo fetch failed for ${mappedTicker}: ${yahoo.error ?? 'Missing Yahoo data'}`,
-      {
-        isin: entry.meta.isin,
-        name: entry.meta.name,
-        market: entry.meta.market,
-        currency: entry.meta.currency
-      }
+      `Yahoo fetch failed for ${entry.ticker}: ${yahoo.error ?? 'Missing Yahoo data'}`
     );
   }
 
-  return buildOutput(
-    mappedTicker,
+  const output = buildOutput(
+    entry.ticker,
     entry.input,
     yahoo.data as YahooQuoteSummaryResponse,
     'ok',
-    undefined,
-    {
-      isin: entry.meta.isin,
-      name: entry.meta.name,
-      market: entry.meta.market,
-      currency: entry.meta.currency
-    }
+    undefined
   );
+
+  return ensureDataCompleteness(output);
 }
 
 function buildOutput(
@@ -192,17 +249,16 @@ function buildOutput(
   input: string,
   data: YahooQuoteSummaryResponse | undefined,
   status: 'ok' | 'error',
-  message?: string,
-  meta?: { isin?: string; name?: string; market?: string; currency?: string }
+  message?: string
 ): OutputRow {
   if (!data || status === 'error') {
     return {
       Input: input,
       Ticker: ticker,
-      ISIN: meta?.isin,
-      Name: meta?.name,
-      Market: meta?.market,
-      Currency: meta?.currency,
+      ISIN: undefined,
+      Name: undefined,
+      Market: undefined,
+      Currency: undefined,
       Price: null,
       'Shares_Out (M)': null,
       Total_Debt: null,
@@ -273,10 +329,10 @@ function buildOutput(
   return {
     Input: input,
     Ticker: ticker,
-    ISIN: meta?.isin,
-    Name: meta?.name,
-    Market: meta?.market,
-    Currency: meta?.currency,
+    ISIN: undefined,
+    Name: undefined,
+    Market: undefined,
+    Currency: undefined,
     Price: snapshot.price ?? null,
     'Shares_Out (M)': snapshot.sharesOutstanding ? snapshot.sharesOutstanding / 1_000_000 : null,
     Total_Debt: snapshot.totalDebt ?? null,
@@ -321,48 +377,46 @@ async function main() {
   program
     .name('equity-agent')
     .description('Fetch fundamental datasets for equities using Yahoo Finance data')
-    .argument('[isins...]', 'ISIN codes to fetch')
-    .option('-i, --input <file>', 'CSV input containing ISIN values for each row')
-    .option('--isin-map <file>', 'CSV lookup table with columns isin,ticker', 'data/isin_map.csv')
+    .argument('[tickers...]', 'Ticker symbols to fetch')
+    .option('-i, --input <file>', 'Text file (.txt) containing one ticker per line')
     .option('-o, --output <file>', 'Write results to CSV file instead of stdout')
     .option('--max-qps <number>', 'Maximum Yahoo Finance requests per second', '1')
     .parse(process.argv);
 
-  const opts = program.opts<{ input?: string; isinMap?: string; output?: string; maxQps?: string }>();
-  const argIsins = (program.args as string[]).map((value) => value.trim().toUpperCase()).filter((value) => value.length > 0);
-
-  const isinMapPath = opts.isinMap ? resolve(opts.isinMap) : resolve('data/isin_map.csv');
-  const isinMap = loadIsinMap(isinMapPath);
+  const opts = program.opts<{ input?: string; output?: string; maxQps?: string }>();
+  const argTickers = (program.args as string[])
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .map((value) => normalizeTicker(value));
   const entries: InputEntry[] = [];
 
   if (opts.input) {
-    const parsed = parseRows(opts.input);
+    const parsed = parseTickerFile(opts.input);
     entries.push(...parsed);
   }
 
-  argIsins.forEach((value) => {
+  argTickers.forEach((value) => {
     entries.push({
       input: value,
-      isin: value,
-      meta: { isin: value }
+      ticker: value
     });
   });
 
   if (!entries.length) {
     if (opts.input) {
       throw new Error(
-        `No ISIN values found in ${opts.input}. Ensure each row provides an ISIN or supply ISINs as arguments.`
+        `No ticker values found in ${opts.input}. Ensure the file lists one ticker per line or supply tickers as arguments.`
       );
     }
 
-    throw new Error('No ISIN values provided. Use positional arguments or --input.');
+    throw new Error('No ticker values provided. Use positional arguments or --input.');
   }
 
   const maxQps = Number.parseFloat(opts.maxQps ?? '1');
   const results: OutputRow[] = [];
 
   for (const entry of entries) {
-    const row = await fetchEntry(entry, maxQps, isinMap);
+    const row = await fetchEntry(entry, maxQps);
     results.push(row);
   }
 
