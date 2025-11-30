@@ -20,6 +20,9 @@ interface InputEntry {
   };
 }
 
+const DEFAULT_ALPHASPREAD_KEY = 'IJ2RNTVBPOGCMXU6';
+const DEFAULT_FMP_KEY = 'F1yosD2d9MyjBwAYw95MkRAKpdsGxIja';
+
 interface OutputRow {
   Input: string;
   Ticker: string;
@@ -63,6 +66,138 @@ interface OutputRow {
   Altman_Z: number | null;
   Status: string;
   Message?: string;
+}
+
+async function fetchJson<T>(url: string): Promise<T | null> {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // eslint-disable-next-line no-console
+    console.warn(`Data check fetch failed for ${url}: ${message}`);
+    return null;
+  }
+}
+
+async function fetchFmpBalance(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${ticker}?limit=1&apikey=${apiKey}`
+  );
+}
+
+async function fetchFmpCashflow(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v3/cash-flow-statement/${ticker}?limit=1&apikey=${apiKey}`
+  );
+}
+
+async function fetchFmpIncome(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v3/income-statement/${ticker}?limit=1&apikey=${apiKey}`
+  );
+}
+
+async function fetchFmpShortInterest(ticker: string, apiKey: string) {
+  return fetchJson<Array<Record<string, number | string>>>(
+    `https://financialmodelingprep.com/api/v4/short-interest?symbol=${ticker}&apikey=${apiKey}`
+  );
+}
+
+function coerceNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return value;
+  const parsed = Number.parseFloat(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mergeMessage(row: OutputRow, note: string) {
+  if (!note) return;
+  if (row.Message) {
+    row.Message = `${row.Message}; ${note}`;
+  } else {
+    row.Message = note;
+  }
+}
+
+async function backfillFromFmp(row: OutputRow, apiKey: string): Promise<void> {
+  const [balance, cashflow, income, shortInterest] = await Promise.all([
+    row.Total_Equity === null || row.Receivables === null || row.Current_Assets === null || row.Current_Liabilities === null
+      ? fetchFmpBalance(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null),
+    row.Dividends_Paid === null
+      ? fetchFmpCashflow(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null),
+    row.Tax_Rate === null
+      ? fetchFmpIncome(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null),
+    row['Short_Interest_%'] === null
+      ? fetchFmpShortInterest(row.Ticker, apiKey)
+      : Promise.resolve<null | Array<Record<string, number | string>>>(null)
+  ]);
+
+  const balanceRow = balance?.[0];
+  if (balanceRow) {
+    if (row.Total_Equity === null) row.Total_Equity = coerceNumber(balanceRow.totalStockholdersEquity);
+    if (row.Receivables === null) row.Receivables = coerceNumber(balanceRow.netReceivables);
+    if (row.Current_Assets === null) row.Current_Assets = coerceNumber(balanceRow.totalCurrentAssets ?? balanceRow.currentAssets);
+    if (row.Current_Liabilities === null) {
+      row.Current_Liabilities = coerceNumber(
+        balanceRow.totalCurrentLiabilities ?? balanceRow.currentLiabilities ?? balanceRow.totalCurrentLiabilitiesNet
+      );
+    }
+  }
+
+  const cashflowRow = cashflow?.[0];
+  if (cashflowRow && row.Dividends_Paid === null) {
+    row.Dividends_Paid = coerceNumber(cashflowRow.dividendsPaid ?? cashflowRow.dividendPayout);
+  }
+
+  const incomeRow = income?.[0];
+  if (incomeRow && row.Tax_Rate === null) {
+    const tax = coerceNumber(incomeRow.incomeTaxExpense);
+    const pretax = coerceNumber(incomeRow.incomeBeforeTax);
+    if (tax !== null && pretax !== null && pretax !== 0) {
+      row.Tax_Rate = Math.max(0, Math.min(1, tax / pretax));
+    }
+  }
+
+  const shortInterestRow = shortInterest?.[0];
+  if (shortInterestRow && row['Short_Interest_%'] === null) {
+    const percent = coerceNumber(shortInterestRow.shortInterestRatio ?? shortInterestRow.shortPercent ?? shortInterestRow.shortFloat);
+    if (percent !== null) {
+      row['Short_Interest_%'] = percent;
+    }
+  }
+}
+
+async function checkAlphaspread(row: OutputRow, apiKey: string): Promise<void> {
+  // Alphaspread API details are not public; we log the intention to fetch without failing the run.
+  if (row.Tax_Rate !== null && row.Total_Equity !== null && row.Dividends_Paid !== null && row.Receivables !== null) return;
+  mergeMessage(row, `Alphaspread key ${apiKey} available for supplementary checks (no public endpoint configured)`);
+}
+
+async function ensureDataCompleteness(row: OutputRow): Promise<OutputRow> {
+  if (row.Status !== 'ok') return row;
+  const alphaspreadKey = process.env.ALPHASPREAD_API_KEY || DEFAULT_ALPHASPREAD_KEY;
+  const fmpKey = process.env.FMP_API_KEY || DEFAULT_FMP_KEY;
+
+  const before = { ...row };
+  await Promise.all([checkAlphaspread(row, alphaspreadKey), backfillFromFmp(row, fmpKey)]);
+
+  const touched: string[] = [];
+  (['Total_Equity', 'Dividends_Paid', 'Receivables', 'Tax_Rate', 'Short_Interest_%'] as const).forEach((field) => {
+    if (before[field] !== row[field] && row[field] !== null) {
+      touched.push(`${field} from supplemental sources`);
+    }
+  });
+
+  if (touched.length) {
+    mergeMessage(row, touched.join('; '));
+  }
+
+  return row;
 }
 
 function estimateWacc(beta: number | null): number {
@@ -172,7 +307,7 @@ async function fetchEntry(entry: InputEntry, maxQps: number, isinMap: Record<str
     );
   }
 
-  return buildOutput(
+  const output = buildOutput(
     mappedTicker,
     entry.input,
     yahoo.data as YahooQuoteSummaryResponse,
@@ -185,6 +320,8 @@ async function fetchEntry(entry: InputEntry, maxQps: number, isinMap: Record<str
       currency: entry.meta.currency
     }
   );
+
+  return ensureDataCompleteness(output);
 }
 
 function buildOutput(
